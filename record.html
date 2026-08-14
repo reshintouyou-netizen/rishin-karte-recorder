@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>🎙 録音</title>
+<!--
+  りしんカルテ 録音ページ
+    Google Apps Script の iframe ではマイク(getUserMedia)が使えないため、
+    このページをポップアップで開いて録音し、音声チャンクを postMessage で
+    呼び出し元(カルテ画面)へ返す。アップロードと患者への紐づけは
+    カルテ画面側が行う(このページは患者情報を一切受け取らない・保持しない)。
+
+  ⚠ このリポジトリは公開。患者情報・APIキー・スプレッドシートIDを書かないこと。
+  ⚠ 音声データはメモリ上で親ウィンドウへ渡すだけ。このページはどこにも保存しない。
+-->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Kaku Gothic ProN", "Noto Sans JP", Meiryo, sans-serif;
+    background: #1c1e26; color: #f2f3f7; min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    padding: 20px; text-align: center;
+  }
+  .wrap { width: 100%; max-width: 360px; }
+  h1 { font-size: 18px; font-weight: 700; margin-bottom: 18px; }
+  .state { font-size: 16px; margin-bottom: 6px; min-height: 24px; }
+  .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #666; margin-right: 8px; vertical-align: 1px; }
+  .dot.rec { background: #e5484d; animation: blink 1.2s infinite; }
+  @keyframes blink { 50% { opacity: .25; } }
+  .time { font-size: 48px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 6px 0 18px; }
+  button {
+    width: 100%; min-height: 56px; font-size: 18px; font-weight: 700;
+    border: none; border-radius: 12px; cursor: pointer; font-family: inherit;
+    background: #e5484d; color: #fff; padding: 14px;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .warn {
+    display: none; margin-top: 14px; padding: 10px 12px; border-radius: 8px;
+    background: #4a3a12; color: #ffd166; font-size: 16px; line-height: 1.6;
+  }
+  .err {
+    display: none; margin-top: 14px; padding: 10px 12px; border-radius: 8px;
+    background: #43191c; color: #ff9b9e; font-size: 16px; line-height: 1.6; text-align: left;
+    word-break: break-all;
+  }
+  .sub { margin-top: 14px; font-size: 13px; color: #9aa0b0; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎙 録音</h1>
+  <div class="state"><span class="dot" id="dot"></span><span id="stateText">カルテ画面と接続しています...</span></div>
+  <div class="time" id="time">0:00</div>
+  <button id="stopBtn" onclick="requestStop('手動')" disabled>■ 停止して保存</button>
+  <div class="warn" id="warnBox"></div>
+  <div class="err" id="errBox"></div>
+  <div class="sub" id="subText">このウィンドウは録音専用です。閉じずにそのままにしてください。<br>停止するとカルテに自動で保存されます。</div>
+</div>
+
+<script>
+'use strict';
+
+// ============================================================
+// 設定(カルテ画面からの init で上書きされる)
+// ============================================================
+var WARN_SEC = 5100;    // 85分: 停止5分前の警告
+var MAX_SEC  = 5400;    // 90分: 自動停止(消し忘れ対策)
+
+// ============================================================
+// 親ウィンドウ(カルテ画面)との接続
+//   ・患者情報は受け取らない(タイマー設定のみ)
+//   ・チャンクは {type:'rkrec-chunk'} で送り、ack が返るまで再送する
+// ============================================================
+var parentWin    = window.opener || null;
+var parentOrigin = '';        // init メッセージの origin で固定する
+var connected    = false;
+
+var mediaRecorder = null;
+var recStream     = null;
+var recMime       = '';
+var chunkIndex    = 0;
+var pending       = {};       // index -> base64 (ack 待ち。ack が来たら消す)
+var sentCount     = 0;
+var intentionalStop = false;
+var restartCount  = 0;
+var recSec        = 0;
+var timerId       = null;
+var stopped       = false;
+var readerBusy    = 0;
+var wakeLock      = null;
+
+function $(id) { return document.getElementById(id); }
+function setState(t, rec) {
+  $('stateText').textContent = t;
+  $('dot').className = 'dot' + (rec ? ' rec' : '');
+}
+function showWarn(t) { var b = $('warnBox'); b.textContent = t; b.style.display = 'block'; }
+function showErr(t)  { var b = $('errBox');  b.textContent = '⚠ ' + t; b.style.display = 'block'; }
+
+// ---- 接続ハンドシェイク ----
+//   ready を親へ送る(データ無し) → 親が init を返す → origin を固定して録音開始
+var readyTries = 0;
+function sendReady() {
+  if (connected) return;
+  if (!parentWin || parentWin.closed) {
+    setState('接続できません', false);
+    showErr('カルテ画面から開かれていません。カルテの 🎙 ボタンから開いてください。');
+    return;
+  }
+  try { parentWin.postMessage({ type: 'rkrec-ready' }, '*'); } catch (e) {}
+  readyTries++;
+  if (readyTries < 15) setTimeout(sendReady, 1000);
+  else if (!connected) {
+    setState('接続できません', false);
+    showErr('カルテ画面と接続できませんでした。このウィンドウを閉じ、カルテの 🎙 ボタンからもう一度開いてください。');
+  }
+}
+
+window.addEventListener('message', function(e) {
+  // init 前は「開いた元のウィンドウ」からだけ受け付け、init の origin で以後を固定する
+  if (!connected) {
+    if (e.source !== parentWin) return;
+    var d0 = e.data || {};
+    if (d0.type !== 'rkrec-init') return;
+    parentOrigin = e.origin;
+    connected = true;
+    if (typeof d0.warnSec === 'number' && d0.warnSec > 0) WARN_SEC = d0.warnSec;
+    if (typeof d0.maxSec  === 'number' && d0.maxSec  > 0) MAX_SEC  = d0.maxSec;
+    startRecording();
+    return;
+  }
+  if (e.origin !== parentOrigin) return;
+  var d = e.data || {};
+  if (d.type === 'rkrec-chunk-ack') {
+    if (pending[d.index] !== undefined) { delete pending[d.index]; sentCount++; }
+  } else if (d.type === 'rkrec-stop') {
+    requestStop('カルテ画面からの停止');
+  } else if (d.type === 'rkrec-done') {
+    if (d.ok) {
+      setState('保存しました ✅', false);
+      $('subText').textContent = 'このウィンドウは自動で閉じます。';
+      setTimeout(function() { window.close(); }, 1500);
+    } else {
+      setState('保存エラー', false);
+      showErr('カルテ側の保存に失敗しました: ' + (d.error || '') + ' / 録音チャンクは送信済みです。カルテ画面を確認してください。');
+    }
+  }
+});
+
+function post(msg) {
+  if (!parentWin || parentWin.closed || !parentOrigin) return false;
+  try { parentWin.postMessage(msg, parentOrigin); return true; } catch (e) { return false; }
+}
+
+// ---- ack が返らないチャンクの再送(最低1回どころか、届くまで5秒ごと) ----
+setInterval(function() {
+  if (!connected) return;
+  var keys = Object.keys(pending);
+  if (!keys.length) return;
+  if (!parentWin || parentWin.closed) {
+    showErr('カルテ画面が閉じられたため、音声を送れません。カルテ画面を開き直しても、このウィンドウのデータは戻せません。');
+    return;
+  }
+  keys.forEach(function(k) {
+    post({ type: 'rkrec-chunk', index: Number(k), base64: pending[k], mime: recMime });
+  });
+}, 5000);
+
+// ============================================================
+// 録音本体(りしんカルテ v1.22 と同じ設計:
+//   24kbpsモノラル / 1分チャンク / 異常停止から最大3回自動復帰 / Wake Lock)
+// ============================================================
+function startRecording() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    setState('録音できません', false);
+    showErr('このブラウザは録音に対応していません。');
+    return;
+  }
+  setState('マイクの許可を待っています...', false);
+  navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+  }).then(function(stream) {
+    recStream = stream;
+    recMime = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) ? 'audio/webm;codecs=opus'
+            : (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm'))             ? 'audio/webm'
+            : 'audio/ogg';
+    startMediaRecorder(stream);
+    startTimer();
+    acquireWakeLock();
+    setState('録音中', true);
+    $('stopBtn').disabled = false;
+  }).catch(function(err) {
+    setState('録音できません', false);
+    var name = (err && err.name) || '';
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      showErr('マイクの使用が許可されませんでした。アドレスバーのマイクのアイコン(または鍵マーク)から「許可」にして、ページを再読み込みしてください。');
+    } else if (name === 'NotFoundError') {
+      showErr('マイクが見つかりません。');
+    } else if (name === 'NotReadableError') {
+      showErr('マイクが他のアプリに使用中です。');
+    } else {
+      showErr('マイクエラー: ' + name + ' ' + ((err && err.message) || ''));
+    }
+  });
+}
+
+function startMediaRecorder(stream) {
+  try {
+    mediaRecorder = new MediaRecorder(stream, { mimeType: recMime, audioBitsPerSecond: 24000 });
+  } catch (e) {
+    mediaRecorder = new MediaRecorder(stream, { mimeType: recMime });
+  }
+  mediaRecorder.ondataavailable = function(e) {
+    if (e.data && e.data.size > 0) enqueueChunk(e.data);
+  };
+  mediaRecorder.onstop = function() {
+    try { if (recStream) recStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    if (intentionalStop) finishAndNotify();
+    else handleAbnormalStop();
+  };
+  mediaRecorder.onerror = function() {
+    if (!intentionalStop) handleAbnormalStop();
+  };
+  stream.getTracks().forEach(function(t) {
+    t.onended = function() {
+      if (!intentionalStop && mediaRecorder && mediaRecorder.state === 'recording') {
+        try { mediaRecorder.stop(); } catch (e) {}
+      }
+    };
+  });
+  mediaRecorder.start(60000);   // 1分ごとにチャンク発生
+}
+
+function enqueueChunk(blob) {
+  var idx = chunkIndex++;
+  readerBusy++;
+  var reader = new FileReader();
+  reader.onload = function(e) {
+    readerBusy--;
+    var base64 = (String(e.target.result).split(',')[1]) || '';
+    pending[idx] = base64;
+    post({ type: 'rkrec-chunk', index: idx, base64: base64, mime: recMime });
+  };
+  reader.onerror = function() { readerBusy--; showErr('音声チャンクの読み取りに失敗しました (#' + idx + ')'); };
+  reader.readAsDataURL(blob);
+}
+
+// ---- 異常停止 → 自動復帰(最大3回。チャンク連番は引き継ぐ) ----
+function handleAbnormalStop() {
+  if (restartCount >= 3) {
+    showErr('録音を再開できませんでした。録れた分を保存します。');
+    intentionalStop = true;
+    finishAndNotify();
+    return;
+  }
+  restartCount++;
+  setState('録音が中断しました。再開しています... (' + restartCount + '/3)', false);
+  navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+  }).then(function(stream) {
+    recStream = stream;
+    startMediaRecorder(stream);
+    acquireWakeLock();
+    setState('録音中(再開しました)', true);
+  }).catch(function() {
+    setTimeout(handleAbnormalStop, 1500);
+  });
+}
+
+// ---- タイマー / 85分警告 / 90分自動停止 ----
+function startTimer() {
+  if (timerId) clearInterval(timerId);
+  timerId = setInterval(function() {
+    recSec++;
+    var m = Math.floor(recSec / 60);
+    var s = String(recSec % 60);
+    if (s.length < 2) s = '0' + s;
+    $('time').textContent = m + ':' + s;
+    post({ type: 'rkrec-tick', sec: recSec });
+    if (recSec === WARN_SEC) showWarn('⚠️ あと5分で自動停止します(90分の上限)');
+    if (recSec >= MAX_SEC && !intentionalStop) {
+      showWarn('⏹ 90分たったため、録音を自動停止して保存します');
+      requestStop('90分の自動停止');
+    }
+  }, 1000);
+}
+
+// ---- 停止 → 未送信チャンクを送り切る → カルテ画面へ通知 ----
+function requestStop(reason) {
+  if (stopped) return;
+  intentionalStop = true;
+  $('stopBtn').disabled = true;
+  setState('停止しています... (' + reason + ')', false);
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();   // 最後の ondataavailable → onstop → finishAndNotify
+  } else {
+    finishAndNotify();
+  }
+}
+
+function finishAndNotify() {
+  if (stopped) return;
+  stopped = true;
+  if (timerId) { clearInterval(timerId); timerId = null; }
+  releaseWakeLock();
+  var tries = 0;
+  (function waitDrain() {
+    var left = Object.keys(pending).length + readerBusy;
+    if (left > 0 && tries < 240) {   // 最大2分待つ(再送は5秒ごとに走っている)
+      tries++;
+      setState('音声を送信しています... 残り' + left, false);
+      setTimeout(waitDrain, 500);
+      return;
+    }
+    if (left > 0) {
+      showErr('未送信のチャンクが' + left + '個残っています。カルテ画面が開いているか確認してください。');
+      stopped = false;                // もう一度停止処理をやり直せるように戻す
+      $('stopBtn').disabled = false;
+      return;
+    }
+    post({ type: 'rkrec-stopped', chunkCount: chunkIndex, mime: (recMime.split(';')[0] || 'audio/webm') });
+    setState('カルテに保存しています...', false);
+    $('subText').textContent = '保存が終わると自動で閉じます。';
+  })();
+}
+
+// ---- Wake Lock(画面スリープ抑止) ----
+function acquireWakeLock() {
+  try {
+    if (!navigator.wakeLock) return;
+    navigator.wakeLock.request('screen').then(function(wl) {
+      wakeLock = wl;
+      wl.addEventListener('release', function() { wakeLock = null; });
+    }).catch(function() {});
+  } catch (e) {}
+}
+function releaseWakeLock() {
+  try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
+}
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'visible' && mediaRecorder && mediaRecorder.state === 'recording') acquireWakeLock();
+});
+
+// ---- 閉じる前の警告(録音中・未送信データがあるとき) ----
+window.addEventListener('beforeunload', function(e) {
+  var recording = mediaRecorder && mediaRecorder.state === 'recording';
+  var unsent = Object.keys(pending).length + readerBusy;
+  if (recording || unsent > 0) {
+    e.preventDefault();
+    e.returnValue = '録音中または未送信のデータがあります。閉じますか？';
+    return e.returnValue;
+  }
+});
+
+sendReady();
+</script>
+</body>
+</html>
