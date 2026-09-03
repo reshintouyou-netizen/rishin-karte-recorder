@@ -12,7 +12,15 @@
     カルテ画面側が行う(このページは患者情報を一切受け取らない・保持しない)。
 
   ⚠ このリポジトリは公開。患者情報・APIキー・スプレッドシートIDを書かないこと。
-  ⚠ 音声データはメモリ上で親ウィンドウへ渡すだけ。このページはどこにも保存しない。
+  ⚠ 音声チャンクは「この端末の IndexedDB」に一時退避し、親ウィンドウへ渡すだけ。
+     患者情報は保存しない。ack が返ったチャンクは即消す。サーバへは一切送らない。
+
+  ── 音声を失わないための設計(案A) ──
+    ・録音チャンクを IndexedDB に退避する(メモリだけだと閉じると消えるため)
+    ・親(カルテ画面)が閉じても、このウィンドウにデータは残る
+    ・親を開き直したら、親から届く rkrec-init(再接続)で送信先を張り替えて自動再送
+    ・手動の「もう一度送信する」ボタンでも送れる
+    ・ack が返ったチャンクは IndexedDB から消す(溜め続けない)
 -->
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -34,6 +42,7 @@
     border: none; border-radius: 12px; cursor: pointer; font-family: inherit;
     background: #e5484d; color: #fff; padding: 14px;
   }
+  button.secondary { background: #2f6df0; margin-top: 10px; }
   button:disabled { opacity: .5; cursor: default; }
   .warn {
     display: none; margin-top: 14px; padding: 10px 12px; border-radius: 8px;
@@ -53,6 +62,8 @@
   <div class="state"><span class="dot" id="dot"></span><span id="stateText">カルテ画面と接続しています...</span></div>
   <div class="time" id="time">0:00</div>
   <button id="stopBtn" onclick="requestStop('手動')" disabled>■ 停止して保存</button>
+  <button id="resendBtn" class="secondary" onclick="manualResend()" style="display:none">🔄 もう一度送信する</button>
+  <button id="dlBtn" class="secondary" onclick="downloadLocal()" style="display:none">💾 音声をこの端末に保存</button>
   <div class="warn" id="warnBox"></div>
   <div class="err" id="errBox"></div>
   <div class="sub" id="subText">このウィンドウは録音専用です。閉じずにそのままにしてください。<br>停止するとカルテに自動で保存されます。</div>
@@ -71,6 +82,8 @@ var MAX_SEC  = 5400;    // 90分: 自動停止(消し忘れ対策)
 // 親ウィンドウ(カルテ画面)との接続
 //   ・患者情報は受け取らない(タイマー設定のみ)
 //   ・チャンクは {type:'rkrec-chunk'} で送り、ack が返るまで再送する
+//   ・親が閉じても IndexedDB にチャンクが残る。親を開き直すと rkrec-init で
+//     送信先を張り替えて自動再送する(案A)
 // ============================================================
 var parentWin    = window.opener || null;
 var parentOrigin = '';        // init メッセージの origin で固定する
@@ -89,6 +102,7 @@ var timerId       = null;
 var stopped       = false;
 var readerBusy    = 0;
 var wakeLock      = null;
+var parentClosedNotified = false;   // 「親が閉じている」案内を出したか
 
 function $(id) { return document.getElementById(id); }
 function setState(t, rec) {
@@ -96,7 +110,67 @@ function setState(t, rec) {
   $('dot').className = 'dot' + (rec ? ' rec' : '');
 }
 function showWarn(t) { var b = $('warnBox'); b.textContent = t; b.style.display = 'block'; }
+function hideWarn()  { var b = $('warnBox'); b.style.display = 'none'; }
 function showErr(t)  { var b = $('errBox');  b.textContent = '⚠ ' + t; b.style.display = 'block'; }
+function hideErr()   { var b = $('errBox');  b.style.display = 'none'; }
+function unsentCount() { return Object.keys(pending).length + readerBusy; }
+function refreshResendBtn() {
+  // 未送信があるときだけ手動再送ボタンを見せる
+  $('resendBtn').style.display = (unsentCount() > 0) ? 'block' : 'none';
+}
+
+// ============================================================
+// IndexedDB(音声チャンクの退避先)
+//   store 'chunks' keyPath 'index'。中身: {index, base64, mime, at}
+//   ★患者情報は入れない。ack が返ったら delete する。
+// ============================================================
+var DB_NAME = 'rkrec-db', DB_STORE = 'chunks', _db = null;
+function dbOpen() {
+  return new Promise(function(res) {
+    try {
+      var r = indexedDB.open(DB_NAME, 1);
+      r.onupgradeneeded = function() {
+        var db = r.result;
+        if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE, { keyPath: 'index' });
+      };
+      r.onsuccess = function() { _db = r.result; res(_db); };
+      r.onerror   = function() { res(null); };   // IndexedDB不可でも録音は続ける(メモリ pending が保険)
+    } catch (e) { res(null); }
+  });
+}
+function dbPut(rec) {
+  return new Promise(function(res) {
+    if (!_db) return res();
+    try {
+      var tx = _db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).put(rec);
+      tx.oncomplete = function() { res(); };
+      tx.onerror    = function() { res(); };
+    } catch (e) { res(); }
+  });
+}
+function dbDelete(index) {
+  return new Promise(function(res) {
+    if (!_db) return res();
+    try {
+      var tx = _db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).delete(index);
+      tx.oncomplete = function() { res(); };
+      tx.onerror    = function() { res(); };
+    } catch (e) { res(); }
+  });
+}
+function dbGetAll() {
+  return new Promise(function(res) {
+    if (!_db) return res([]);
+    try {
+      var tx = _db.transaction(DB_STORE, 'readonly');
+      var rq = tx.objectStore(DB_STORE).getAll();
+      rq.onsuccess = function() { res(rq.result || []); };
+      rq.onerror   = function() { res([]); };
+    } catch (e) { res([]); }
+  });
+}
 
 // ---- 接続ハンドシェイク ----
 //   ready を親へ送る(データ無し) → 親が init を返す → origin を固定して録音開始
@@ -118,22 +192,42 @@ function sendReady() {
 }
 
 window.addEventListener('message', function(e) {
-  // init 前は「開いた元のウィンドウ」からだけ受け付け、init の origin で以後を固定する
+  var d = e.data || {};
+
+  // ---- 初回接続前: 開いた元のウィンドウからの init だけ受け付け、origin を固定 ----
   if (!connected) {
     if (e.source !== parentWin) return;
-    var d0 = e.data || {};
-    if (d0.type !== 'rkrec-init') return;
+    if (d.type !== 'rkrec-init') return;
     parentOrigin = e.origin;
     connected = true;
-    if (typeof d0.warnSec === 'number' && d0.warnSec > 0) WARN_SEC = d0.warnSec;
-    if (typeof d0.maxSec  === 'number' && d0.maxSec  > 0) MAX_SEC  = d0.maxSec;
+    if (typeof d.warnSec === 'number' && d.warnSec > 0) WARN_SEC = d.warnSec;
+    if (typeof d.maxSec  === 'number' && d.maxSec  > 0) MAX_SEC  = d.maxSec;
     startRecording();
     return;
   }
+
+  // ---- 接続後 ----
   if (e.origin !== parentOrigin) return;
-  var d = e.data || {};
   if (d.type === 'rkrec-chunk-ack') {
-    if (pending[d.index] !== undefined) { delete pending[d.index]; sentCount++; }
+    if (pending[d.index] !== undefined) {
+      delete pending[d.index];
+      sentCount++;
+      dbDelete(Number(d.index));   // ★ack が返ったチャンクは退避先からも消す(溜めない)
+      refreshResendBtn();
+    }
+  } else if (d.type === 'rkrec-init' || d.type === 'rkrec-reconnect') {
+    // ★親(カルテ画面)を開き直した → 送信元を新しい親として採用し、未送信を再送する
+    parentWin = e.source;
+    parentClosedNotified = false;
+    hideErr();
+    if (typeof d.warnSec === 'number' && d.warnSec > 0) WARN_SEC = d.warnSec;
+    if (typeof d.maxSec  === 'number' && d.maxSec  > 0) MAX_SEC  = d.maxSec;
+    if (unsentCount() > 0) {
+      showWarn('カルテ画面と再接続しました。未送信の音声を送っています...');
+      resendPending();
+    } else {
+      hideWarn();
+    }
   } else if (d.type === 'rkrec-stop') {
     requestStop('カルテ画面からの停止');
   } else if (d.type === 'rkrec-done') {
@@ -143,7 +237,7 @@ window.addEventListener('message', function(e) {
       setTimeout(function() { window.close(); }, 1500);
     } else {
       setState('保存エラー', false);
-      showErr('カルテ側の保存に失敗しました: ' + (d.error || '') + ' / 録音チャンクは送信済みです。カルテ画面を確認してください。');
+      showErr('カルテ側の保存に失敗しました: ' + (d.error || '') + ' / 録音は残っています。カルテ画面を確認してください。');
     }
   }
 });
@@ -153,13 +247,79 @@ function post(msg) {
   try { parentWin.postMessage(msg, parentOrigin); return true; } catch (e) { return false; }
 }
 
-// ---- ack が返らないチャンクの再送(最低1回どころか、届くまで5秒ごと) ----
+// 未送信(pending)を全部もう一度送る
+function resendPending() {
+  var keys = Object.keys(pending);
+  keys.forEach(function(k) {
+    post({ type: 'rkrec-chunk', index: Number(k), base64: pending[k], mime: recMime });
+  });
+}
+
+// 手動の「もう一度送信する」
+function manualResend() {
+  if (!parentWin || parentWin.closed || !parentOrigin) {
+    showWarn('カルテ画面(🎙 を開いたタブ)が見つかりません。そのタブを表に出すと自動で送信されます。'
+           + 'タブを閉じてしまった場合は「💾 音声をこの端末に保存」で手元に残し、カルテに手動で添付してください。');
+    $('dlBtn').style.display = 'block';
+    return;
+  }
+  if (unsentCount() === 0) { hideWarn(); return; }
+  setState('未送信の音声を送っています...', false);
+  resendPending();
+}
+
+// ---- 最終保険: 未送信の音声をこの端末にダウンロードして手元に残す ----
+//   カルテ画面のタブ自体を閉じてしまい postMessage で送れないときの救済。
+//   「戻せません」で終わらせないための出口(音声そのものは必ず手元に残せる)。
+function downloadLocal() {
+  dbGetAll().then(function(rows) {
+    if (!rows || !rows.length) {
+      rows = Object.keys(pending).map(function(k) {
+        return { index: Number(k), base64: pending[k], mime: recMime };
+      });
+    }
+    if (!rows.length) { showWarn('保存できる未送信の音声はありません。'); return; }
+    rows.sort(function(a, b) { return a.index - b.index; });
+    var mime = rows[0].mime || recMime || 'audio/webm';
+    var blobParts = rows.map(function(r) {
+      var bin = atob(r.base64 || '');
+      var arr = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      return arr;
+    });
+    var blob = new Blob(blobParts, { type: mime });
+    var ext = (mime.indexOf('ogg') >= 0) ? 'ogg' : 'webm';
+    var now = new Date();
+    var ts = now.getFullYear() + String(now.getMonth() + 1).padStart(2, '0') + String(now.getDate()).padStart(2, '0')
+           + '_' + String(now.getHours()).padStart(2, '0') + String(now.getMinutes()).padStart(2, '0');
+    var a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'rec_' + ts + '.' + ext;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    showWarn('音声をこの端末にダウンロードしました（rec_' + ts + '.' + ext + '）。'
+           + 'カルテの患者を開き、添付から手動で取り込んでください。');
+  });
+}
+
+// ---- ack が返らないチャンクの再送(届くまで5秒ごと)。親が閉じていたら案内を出す ----
 setInterval(function() {
   if (!connected) return;
+  refreshResendBtn();
   var keys = Object.keys(pending);
-  if (!keys.length) return;
-  if (!parentWin || parentWin.closed) {
-    showErr('カルテ画面が閉じられたため、音声を送れません。カルテ画面を開き直しても、このウィンドウのデータは戻せません。');
+  if (!keys.length) { if (parentClosedNotified) { parentClosedNotified = false; } return; }
+  if (!parentWin || parentWin.closed || !parentOrigin) {
+    // ★「戻せません」とは言わない。データは残っており、開き直せば送れることを明確に伝える
+    if (!parentClosedNotified) {
+      parentClosedNotified = true;
+      setState('カルテ画面が閉じています', false);
+      showWarn('カルテ画面が見つかりません。録音はこのウィンドウに保存されています（未送信 ' + keys.length + ' 分）。'
+             + 'カルテ画面のタブを表に出す（または開き直す）と自動で送信されます。🔴 このウィンドウは閉じないでください。'
+             + 'すぐ手元に残したいときは「💾 音声をこの端末に保存」を押してください。');
+      $('resendBtn').style.display = 'block';
+      $('dlBtn').style.display = 'block';
+    }
     return;
   }
   keys.forEach(function(k) {
@@ -240,7 +400,9 @@ function enqueueChunk(blob) {
     readerBusy--;
     var base64 = (String(e.target.result).split(',')[1]) || '';
     pending[idx] = base64;
+    dbPut({ index: idx, base64: base64, mime: recMime, at: Date.now() });   // ★退避(閉じても残る)
     post({ type: 'rkrec-chunk', index: idx, base64: base64, mime: recMime });
+    refreshResendBtn();
   };
   reader.onerror = function() { readerBusy--; showErr('音声チャンクの読み取りに失敗しました (#' + idx + ')'); };
   reader.readAsDataURL(blob);
@@ -306,7 +468,7 @@ function finishAndNotify() {
   releaseWakeLock();
   var tries = 0;
   (function waitDrain() {
-    var left = Object.keys(pending).length + readerBusy;
+    var left = unsentCount();
     if (left > 0 && tries < 240) {   // 最大2分待つ(再送は5秒ごとに走っている)
       tries++;
       setState('音声を送信しています... 残り' + left, false);
@@ -314,9 +476,18 @@ function finishAndNotify() {
       return;
     }
     if (left > 0) {
-      showErr('未送信のチャンクが' + left + '個残っています。カルテ画面が開いているか確認してください。');
+      // ★親が閉じていても「戻せません」とは言わない。データは残っており、開き直せば送れる
       stopped = false;                // もう一度停止処理をやり直せるように戻す
       $('stopBtn').disabled = false;
+      $('resendBtn').style.display = 'block';
+      if (!parentWin || parentWin.closed || !parentOrigin) {
+        setState('カルテ画面が閉じています', false);
+        $('dlBtn').style.display = 'block';
+        showWarn('未送信の音声が' + left + '分あります。カルテ画面のタブを表に出す（または開き直す）と自動で送信されます。'
+               + 'タブを閉じてしまった場合は「💾 音声をこの端末に保存」で手元に残し、カルテに手動で添付してください。🔴 このウィンドウは閉じないでください。');
+      } else {
+        showWarn('未送信の音声が' + left + '分あります。「🔄 もう一度送信する」を押すか、カルテ画面が開いているか確認してください。');
+      }
       return;
     }
     post({ type: 'rkrec-stopped', chunkCount: chunkIndex, mime: (recMime.split(';')[0] || 'audio/webm') });
@@ -345,15 +516,41 @@ document.addEventListener('visibilitychange', function() {
 // ---- 閉じる前の警告(録音中・未送信データがあるとき) ----
 window.addEventListener('beforeunload', function(e) {
   var recording = mediaRecorder && mediaRecorder.state === 'recording';
-  var unsent = Object.keys(pending).length + readerBusy;
-  if (recording || unsent > 0) {
+  if (recording || unsentCount() > 0) {
     e.preventDefault();
-    e.returnValue = '録音中または未送信のデータがあります。閉じますか？';
+    e.returnValue = '録音中または未送信の音声があります。閉じますか？';
     return e.returnValue;
   }
 });
 
-sendReady();
+// ============================================================
+// 起動: IndexedDB を開く → 前回の未送信チャンクが残っていれば復元して知らせる
+//   (ウィンドウがクラッシュ等で一度閉じても、開き直せば送れるようにする保険)
+// ============================================================
+dbOpen().then(function() {
+  return dbGetAll();
+}).then(function(rows) {
+  if (rows && rows.length) {
+    // 前回の未送信音声が残っている → pending に復元し、連番を続きから採番する
+    var maxIdx = -1;
+    rows.forEach(function(r) {
+      if (typeof r.index === 'number') {
+        pending[r.index] = r.base64;
+        if (r.mime && !recMime) recMime = r.mime;
+        if (r.index > maxIdx) maxIdx = r.index;
+      }
+    });
+    chunkIndex = maxIdx + 1;
+    sentCount = 0;
+    showWarn('前回の未送信の音声が ' + rows.length + ' 分ぶん残っています。'
+           + 'カルテ画面(🎙 を開いたタブ)を開き直すと自動で送信されます。'
+           + 'すぐ送るには「🔄 もう一度送信する」を押してください。');
+    $('resendBtn').style.display = 'block';
+  }
+  sendReady();
+}).catch(function() {
+  sendReady();
+});
 </script>
 </body>
 </html>
