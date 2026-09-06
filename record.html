@@ -54,6 +54,14 @@
     word-break: break-all;
   }
   .sub { margin-top: 14px; font-size: 13px; color: #9aa0b0; line-height: 1.7; }
+  /* 🔴 0906m: マイク名・音量メーター・無音警告・版番号 */
+  .mic-name { margin-top: 4px; font-size: 13px; color: #cfd3de; line-height: 1.6; word-break: break-word; }
+  .meter { width: 100%; height: 16px; background: #2a2d3a; border-radius: 8px; overflow: hidden; margin: 14px 0 2px; }
+  .meter-fill { height: 100%; width: 0%; background: #2f9e44; border-radius: 8px; transition: width .07s linear, background .2s; }
+  .meter-label { font-size: 12px; color: #9aa0b0; }
+  .silence { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    background: #4a2a12; color: #ffb673; font-size: 15px; line-height: 1.6; }
+  .ver { margin-top: 16px; font-size: 11px; color: #6b7080; }
 </style>
 </head>
 <body>
@@ -61,16 +69,25 @@
   <h1>🎙 録音</h1>
   <div class="state"><span class="dot" id="dot"></span><span id="stateText">カルテ画面と接続しています...</span></div>
   <div class="time" id="time">0:00</div>
+  <!-- 🔴 0906m: 音量メーター（入っているか一目で分かる）＋マイク名＋無音警告 -->
+  <div class="meter" id="meter" title="マイクに入っている音の大きさ"><div class="meter-fill" id="meterFill"></div></div>
+  <div class="meter-label" id="meterLabel">マイク音量</div>
+  <div class="mic-name" id="micName"></div>
+  <div class="silence" id="silenceBox"></div>
   <button id="stopBtn" onclick="requestStop('手動')" disabled>■ 停止して保存</button>
   <button id="resendBtn" class="secondary" onclick="manualResend()" style="display:none">🔄 もう一度送信する</button>
   <button id="dlBtn" class="secondary" onclick="downloadLocal()" style="display:none">💾 音声をこの端末に保存</button>
   <div class="warn" id="warnBox"></div>
   <div class="err" id="errBox"></div>
   <div class="sub" id="subText">このウィンドウは録音専用です。閉じずにそのままにしてください。<br>停止するとカルテに自動で保存されます。</div>
+  <div class="ver" id="ver"></div>
 </div>
 
 <script>
 'use strict';
+
+// 🔴 0906m: 版番号（先生が「最新か」を判断できるように画面に出す）
+var REC_VERSION = 'v2026-09-06a（メーター・マイク名・無音警告）';
 
 // ============================================================
 // 設定(カルテ画面からの init で上書きされる)
@@ -328,6 +345,75 @@ setInterval(function() {
 }, 5000);
 
 // ============================================================
+// 🔴 0906m: 音量メーター / マイク名 / 無音警告
+//   ⚠ すべて best-effort。AudioContext が使えない・失敗しても録音は絶対に止めない。
+// ============================================================
+var audioCtx = null, analyser = null, meterRAF = null, meterData = null;
+var lastSoundAt = 0, silenceShown = false;
+var SILENCE_MS = 10000;   // 10秒 連続で無音なら警告
+var SILENCE_PEAK = 3;     // 128中心の振れ幅がこの値未満＝ほぼ無音
+
+function showMicName(stream) {
+  var label = '';
+  try { var tr = stream.getAudioTracks && stream.getAudioTracks()[0]; if (tr) label = tr.label || ''; } catch (e) {}
+  $('micName').textContent = label ? ('マイク: ' + label) : 'マイク: （名称を取得できませんでした）';
+}
+
+function attachMeter(stream) {
+  stopMeter();
+  try {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { $('meterLabel').textContent = '音量メーター（この端末では表示できません）'; return; }
+    audioCtx = new AC();
+    if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
+    var src = audioCtx.createMediaStreamSource(stream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 512;
+    src.connect(analyser);
+    meterData = new Uint8Array(analyser.fftSize);
+    lastSoundAt = Date.now(); silenceShown = false;
+    $('silenceBox').style.display = 'none';
+    loopMeter();
+  } catch (e) {
+    $('meterLabel').textContent = '音量メーター（表示できませんでした）';
+  }
+}
+
+function loopMeter() {
+  if (!analyser) return;
+  try {
+    analyser.getByteTimeDomainData(meterData);
+    var peak = 0;
+    for (var i = 0; i < meterData.length; i++) { var dv = Math.abs(meterData[i] - 128); if (dv > peak) peak = dv; }
+    var pct = Math.min(100, Math.round(peak / 128 * 160));   // ★1.6倍で見やすく
+    var fill = $('meterFill');
+    if (fill) {
+      fill.style.width = pct + '%';
+      fill.style.background = pct > 75 ? '#e5484d' : (pct > 40 ? '#f5a623' : '#2f9e44');
+    }
+    // 無音判定（録音中のみ）
+    var recording = mediaRecorder && mediaRecorder.state === 'recording';
+    if (peak >= SILENCE_PEAK) {
+      lastSoundAt = Date.now();
+      if (silenceShown) { silenceShown = false; $('silenceBox').style.display = 'none'; }
+    } else if (recording && (Date.now() - lastSoundAt) > SILENCE_MS && !silenceShown) {
+      silenceShown = true;
+      $('silenceBox').textContent = '🔇 音がほとんど入っていません。マイクの位置・ミュート・入力デバイスをご確認ください（録音は続いています）。';
+      $('silenceBox').style.display = 'block';
+    }
+  } catch (e) {}
+  meterRAF = requestAnimationFrame(loopMeter);
+}
+
+function stopMeter() {
+  if (meterRAF) { cancelAnimationFrame(meterRAF); meterRAF = null; }
+  try { if (audioCtx) audioCtx.close(); } catch (e) {}
+  audioCtx = null; analyser = null;
+  var fill = $('meterFill'); if (fill) fill.style.width = '0%';
+  var sb = $('silenceBox'); if (sb) sb.style.display = 'none';
+}
+
+// ============================================================
 // 録音本体(りしんカルテ v1.22 と同じ設計:
 //   24kbpsモノラル / 1分チャンク / 異常停止から最大3回自動復帰 / Wake Lock)
 // ============================================================
@@ -348,6 +434,8 @@ function startRecording() {
     startMediaRecorder(stream);
     startTimer();
     acquireWakeLock();
+    showMicName(stream);     // 🔴 0906m
+    attachMeter(stream);     // 🔴 0906m
     setState('録音中', true);
     $('stopBtn').disabled = false;
   }).catch(function(err) {
@@ -424,6 +512,8 @@ function handleAbnormalStop() {
     recStream = stream;
     startMediaRecorder(stream);
     acquireWakeLock();
+    showMicName(stream);     // 🔴 0906m
+    attachMeter(stream);     // 🔴 0906m（新しいストリームに張り替え）
     setState('録音中(再開しました)', true);
   }).catch(function() {
     setTimeout(handleAbnormalStop, 1500);
@@ -466,6 +556,7 @@ function finishAndNotify() {
   stopped = true;
   if (timerId) { clearInterval(timerId); timerId = null; }
   releaseWakeLock();
+  stopMeter();   // 🔴 0906m: メーター停止（AudioContext を閉じる）
   var tries = 0;
   (function waitDrain() {
     var left = unsentCount();
@@ -527,6 +618,9 @@ window.addEventListener('beforeunload', function(e) {
 // 起動: IndexedDB を開く → 前回の未送信チャンクが残っていれば復元して知らせる
 //   (ウィンドウがクラッシュ等で一度閉じても、開き直せば送れるようにする保険)
 // ============================================================
+// 🔴 0906m: 版番号を表示（先生が最新か判断できるように）
+try { $('ver').textContent = REC_VERSION; } catch (e) {}
+
 dbOpen().then(function() {
   return dbGetAll();
 }).then(function(rows) {
