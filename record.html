@@ -21,6 +21,15 @@
     ・親を開き直したら、親から届く rkrec-init(再接続)で送信先を張り替えて自動再送
     ・手動の「もう一度送信する」ボタンでも送れる
     ・ack が返ったチャンクは IndexedDB から消す(溜め続けない)
+
+  ── 🎙 1026recsplit(2026-10-26): 切り替えても止めずに区切る・無音で自動停止・待機 ──
+    ・カルテ画面から rkrec-split が来たら、録音は止めずに「区切りの時刻」を決めて返す
+      (切り替えの前 3分以内で一番近い「話が途切れた所(静けさ)」。無ければ 1分前。数字は init で変えられる)
+      ※ 区切りの時刻だけを返す。音声を分けるのはカルテ画面側(サーバ)
+    ・音のない状態が 5分(init で変えられる)続いたら自動で止めて保存し、マイクは開いたまま「待機」する
+      (話し始めたら rkrec-voice をカルテ画面へ送り、カルテ画面の指示(rkrec-start)で新しい録音を始める)
+    ・90分(init で変えられる)で止めて保存し、待機する(続きはカルテ画面の指示で新しい録音)
+    ・静けさの判定は音声処理ノード(ScriptProcessor)で行う(ウィンドウが隠れていても動く。rAF は止まるため)
 -->
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -35,30 +44,27 @@
   .state { font-size: 16px; margin-bottom: 6px; min-height: 24px; }
   .dot { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background: #666; margin-right: 8px; vertical-align: 1px; }
   .dot.rec { background: #e5484d; animation: blink 1.2s infinite; }
+  .dot.idle { background: #f5a623; }
   @keyframes blink { 50% { opacity: .25; } }
   .time { font-size: 48px; font-weight: 700; font-variant-numeric: tabular-nums; margin: 6px 0 18px; }
   button {
-    width: 100%; min-height: 56px; font-size: 18px; font-weight: 700;
-    border: none; border-radius: 12px; cursor: pointer; font-family: inherit;
-    background: #e5484d; color: #fff; padding: 14px;
+    width: 100%; padding: 14px; font-size: 17px; font-weight: 700; border: none; border-radius: 10px;
+    background: #e5484d; color: #fff; cursor: pointer; margin-top: 8px;
   }
-  button.secondary { background: #2f6df0; margin-top: 10px; }
-  button:disabled { opacity: .5; cursor: default; }
-  .warn {
-    display: none; margin-top: 14px; padding: 10px 12px; border-radius: 8px;
-    background: #4a3a12; color: #ffd166; font-size: 16px; line-height: 1.6;
-  }
-  .err {
-    display: none; margin-top: 14px; padding: 10px 12px; border-radius: 8px;
-    background: #43191c; color: #ff9b9e; font-size: 16px; line-height: 1.6; text-align: left;
-    word-break: break-all;
-  }
-  .sub { margin-top: 14px; font-size: 13px; color: #9aa0b0; line-height: 1.7; }
-  /* 🔴 0906m: マイク名・音量メーター・無音警告・版番号 */
-  .mic-name { margin-top: 4px; font-size: 13px; color: #cfd3de; line-height: 1.6; word-break: break-word; }
-  .meter { width: 100%; height: 16px; background: #2a2d3a; border-radius: 8px; overflow: hidden; margin: 14px 0 2px; }
+  button:disabled { background: #555; cursor: default; }
+  button.secondary { background: #3a3d4a; }
+  .sub { font-size: 13px; color: #9aa0b0; margin-top: 14px; line-height: 1.6; }
+  .warn { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    background: #3b2f12; color: #ffd98a; font-size: 14px; line-height: 1.6; }
+  .err { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    background: #3b1a1c; color: #ffb3b6; font-size: 14px; line-height: 1.6; }
+  .idle { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
+    background: #2a2f1a; color: #d6e9a3; font-size: 14px; line-height: 1.6; }
+  .meter { height: 14px; border-radius: 8px; background: #2a2d38; overflow: hidden; margin: 2px auto 4px; width: 100%; max-width: 320px; }
   .meter-fill { height: 100%; width: 0%; background: #2f9e44; border-radius: 8px; transition: width .07s linear, background .2s; }
   .meter-label { font-size: 12px; color: #9aa0b0; }
+  .mic-name { font-size: 12px; color: #9aa0b0; margin-bottom: 8px; min-height: 16px; }
+  .quiet { font-size: 12px; color: #9aa0b0; min-height: 16px; }
   .silence { display: none; margin-top: 12px; padding: 10px 12px; border-radius: 8px;
     background: #4a2a12; color: #ffb673; font-size: 15px; line-height: 1.6; }
   .ver { margin-top: 16px; font-size: 11px; color: #6b7080; }
@@ -73,8 +79,10 @@
   <div class="meter" id="meter" title="マイクに入っている音の大きさ"><div class="meter-fill" id="meterFill"></div></div>
   <div class="meter-label" id="meterLabel">マイク音量</div>
   <div class="mic-name" id="micName"></div>
+  <div class="quiet" id="quietLine"></div>
   <div class="silence" id="silenceBox"></div>
-  <button id="stopBtn" onclick="requestStop('手動')" disabled>■ 停止して保存</button>
+  <div class="idle" id="idleBox"></div>
+  <button id="stopBtn" onclick="stopBtnClick()" disabled>■ 停止して保存</button>
   <button id="resendBtn" class="secondary" onclick="manualResend()" style="display:none">🔄 もう一度送信する</button>
   <button id="dlBtn" class="secondary" onclick="downloadLocal()" style="display:none">💾 音声をこの端末に保存</button>
   <div class="warn" id="warnBox"></div>
@@ -87,13 +95,20 @@
 'use strict';
 
 // 🔴 0906m: 版番号（先生が「最新か」を判断できるように画面に出す）
-var REC_VERSION = 'v2026-09-06a（メーター・マイク名・無音警告）';
+var REC_VERSION = 'v2026-10-26a（切り替えで区切る・無音で自動停止・待機）';
 
 // ============================================================
 // 設定(カルテ画面からの init で上書きされる)
 // ============================================================
 var WARN_SEC = 5100;    // 85分: 停止5分前の警告
 var MAX_SEC  = 5400;    // 90分: 自動停止(消し忘れ対策)
+// 🎙 1026recsplit
+var SILENCE_STOP_SEC   = 600;   // 音のない状態がこの秒数続いたら自動停止(10分。カルテ画面の設定で変わる)
+var SPLIT_LOOKBACK_SEC = 180;   // 区切り: 切り替えの何秒前まで「途切れ」を探すか(3分)
+var SPLIT_FALLBACK_SEC = 60;    // 区切り: 途切れが無いときは何秒前で区切るか(1分)
+var SPLIT_SILENCE_SEC  = 2;     // 区切り: 「途切れ」と見なす静けさの秒数
+var IDLE_CLOSE_SEC     = 1800;  // 待機のまま何秒たったらウィンドウを閉じるか(マイクを持ち続けない)
+var QUIET_PEAK         = 3;     // 128中心の振れ幅がこの値未満＝静か(0906m の無音警告と同じ)
 
 // ============================================================
 // 親ウィンドウ(カルテ画面)との接続
@@ -110,7 +125,7 @@ var mediaRecorder = null;
 var recStream     = null;
 var recMime       = '';
 var chunkIndex    = 0;
-var pending       = {};       // index -> base64 (ack 待ち。ack が来たら消す)
+var pending       = {};       // key -> {base64, index, mime} (ack 待ち。ack が来たら消す)
 var sentCount     = 0;
 var intentionalStop = false;
 var restartCount  = 0;
@@ -121,25 +136,52 @@ var readerBusy    = 0;
 var wakeLock      = null;
 var parentClosedNotified = false;   // 「親が閉じている」案内を出したか
 
+// 🎙 1026recsplit: 録音の区切り・静けさ・待機
+var sessionSerial   = 0;        // このウィンドウで何回目の録音か(IndexedDB の鍵を録音ごとに分ける)
+var sessionStartPerf = 0;       // 録音開始時刻(performance.now())。media ms の基準
+var segStartMs      = 0;        // いまの区切りの始まり(media ms)
+var chunkEndMs      = [];       // index -> その小分けが終わった media ms
+var quietSinceMs    = null;     // 静けさが始まった media ms(音が入ると null)
+var lastSoundMs     = 0;
+var quietSpans      = [];       // 終わった静けさ [{s,e}](SPLIT_SILENCE_SEC 以上のものだけ・直近15分)
+var pendingSplit    = null;     // rkrec-split を受けて、小分けの flush 待ち
+var stopReason      = '';       // 'manual' | 'parent' | 'silence' | 'max' | 'abnormal'
+var stopInfo        = null;
+var keepOpenAfterStop = false;  // 止めた後も待機する(マイクを開いたまま)
+var idle            = false;    // 待機中(録音していない・マイクは開いている)
+var idleReason      = '';
+var idleSince       = 0;
+var idleTimerId     = null;
+var voiceWin        = 0;        // 待機中に「音あり」が続いた回数
+var lastVoicePostAt = 0;
+var procNode        = null;     // ScriptProcessor(静けさの判定用。隠れていても動く)
+var procSrc         = null;
+var meterSrc        = null;
+
 function $(id) { return document.getElementById(id); }
-function setState(t, rec) {
+function setState(t, rec, cls) {
   $('stateText').textContent = t;
-  $('dot').className = 'dot' + (rec ? ' rec' : '');
+  $('dot').className = 'dot' + (rec ? ' rec' : '') + (cls ? ' ' + cls : '');
 }
 function showWarn(t) { var b = $('warnBox'); b.textContent = t; b.style.display = 'block'; }
 function hideWarn()  { var b = $('warnBox'); b.style.display = 'none'; }
 function showErr(t)  { var b = $('errBox');  b.textContent = '⚠ ' + t; b.style.display = 'block'; }
 function hideErr()   { var b = $('errBox');  b.style.display = 'none'; }
+function showIdle(t) { var b = $('idleBox'); b.textContent = t; b.style.display = t ? 'block' : 'none'; }
 function unsentCount() { return Object.keys(pending).length + readerBusy; }
 function refreshResendBtn() {
   // 未送信があるときだけ手動再送ボタンを見せる
   $('resendBtn').style.display = (unsentCount() > 0) ? 'block' : 'none';
 }
+function mediaMs() { return sessionStartPerf ? Math.max(0, Math.round(performance.now() - sessionStartPerf)) : 0; }
+function fmtMs(ms) { var s = Math.round(ms / 1000); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
+function isRecording() { return !!(mediaRecorder && mediaRecorder.state === 'recording'); }
 
 // ============================================================
 // IndexedDB(音声チャンクの退避先)
-//   store 'chunks' keyPath 'index'。中身: {index, base64, mime, at}
+//   store 'chunks' keyPath 'index'。中身: {index(=鍵), base64, mime, at, sidx, sid}
 //   ★患者情報は入れない。ack が返ったら delete する。
+//   🎙 1026recsplit: 鍵は 録音の通し番号×100000 + 小分け番号(待機→再開で小分け番号が 0 に戻るため)
 // ============================================================
 var DB_NAME = 'rkrec-db', DB_STORE = 'chunks', _db = null;
 function dbOpen() {
@@ -199,13 +241,27 @@ function sendReady() {
     showErr('カルテ画面から開かれていません。カルテの 🎙 ボタンから開いてください。');
     return;
   }
-  try { parentWin.postMessage({ type: 'rkrec-ready' }, '*'); } catch (e) {}
+  try { parentWin.postMessage({ type: 'rkrec-ready', version: REC_VERSION }, '*'); } catch (e) {}
   readyTries++;
   if (readyTries < 15) setTimeout(sendReady, 1000);
   else if (!connected) {
     setState('接続できません', false);
     showErr('カルテ画面と接続できませんでした。このウィンドウを閉じ、カルテの 🎙 ボタンからもう一度開いてください。');
   }
+}
+
+// init / reconnect / start で届く数字を取り込む(無いものは今のまま)
+function applyConfig(d) {
+  var num = function(v) { return (typeof v === 'number' && isFinite(v) && v > 0) ? v : null; };
+  if (num(d.warnSec)) WARN_SEC = d.warnSec;
+  if (num(d.maxSec))  MAX_SEC  = d.maxSec;
+  if (num(d.silenceStopSec))   SILENCE_STOP_SEC   = d.silenceStopSec;
+  if (num(d.splitLookbackSec)) SPLIT_LOOKBACK_SEC = d.splitLookbackSec;
+  if (typeof d.splitFallbackSec === 'number' && d.splitFallbackSec >= 0) SPLIT_FALLBACK_SEC = d.splitFallbackSec;
+  if (num(d.splitSilenceSec))  SPLIT_SILENCE_SEC  = d.splitSilenceSec;
+  if (num(d.idleCloseSec))     IDLE_CLOSE_SEC     = d.idleCloseSec;
+  if (num(d.quietPeak))        QUIET_PEAK         = d.quietPeak;
+  if (WARN_SEC >= MAX_SEC) WARN_SEC = Math.max(60, MAX_SEC - 300);
 }
 
 window.addEventListener('message', function(e) {
@@ -217,8 +273,7 @@ window.addEventListener('message', function(e) {
     if (d.type !== 'rkrec-init') return;
     parentOrigin = e.origin;
     connected = true;
-    if (typeof d.warnSec === 'number' && d.warnSec > 0) WARN_SEC = d.warnSec;
-    if (typeof d.maxSec  === 'number' && d.maxSec  > 0) MAX_SEC  = d.maxSec;
+    applyConfig(d);
     startRecording();
     return;
   }
@@ -226,10 +281,11 @@ window.addEventListener('message', function(e) {
   // ---- 接続後 ----
   if (e.origin !== parentOrigin) return;
   if (d.type === 'rkrec-chunk-ack') {
-    if (pending[d.index] !== undefined) {
-      delete pending[d.index];
+    var key = (d.key !== undefined) ? Number(d.key) : Number(d.index);
+    if (pending[key] !== undefined) {
+      delete pending[key];
       sentCount++;
-      dbDelete(Number(d.index));   // ★ack が返ったチャンクは退避先からも消す(溜めない)
+      dbDelete(key);   // ★ack が返ったチャンクは退避先からも消す(溜めない)
       refreshResendBtn();
     }
   } else if (d.type === 'rkrec-init' || d.type === 'rkrec-reconnect') {
@@ -237,8 +293,7 @@ window.addEventListener('message', function(e) {
     parentWin = e.source;
     parentClosedNotified = false;
     hideErr();
-    if (typeof d.warnSec === 'number' && d.warnSec > 0) WARN_SEC = d.warnSec;
-    if (typeof d.maxSec  === 'number' && d.maxSec  > 0) MAX_SEC  = d.maxSec;
+    applyConfig(d);
     if (unsentCount() > 0) {
       showWarn('カルテ画面と再接続しました。未送信の音声を送っています...');
       resendPending();
@@ -246,16 +301,31 @@ window.addEventListener('message', function(e) {
       hideWarn();
     }
   } else if (d.type === 'rkrec-stop') {
-    requestStop('カルテ画面からの停止');
+    // 🎙 1026recsplit: keepOpen=true なら止めた後も待機(マイクを開いたまま)
+    keepOpenAfterStop = !!d.keepOpen;
+    requestStop('カルテ画面からの停止', 'parent');
+  } else if (d.type === 'rkrec-split') {
+    doSplit(d);                      // 🎙 1026recsplit: 止めずに区切る
+  } else if (d.type === 'rkrec-start') {
+    startSession(d);                 // 🎙 1026recsplit: 待機中に新しい録音を始める
+  } else if (d.type === 'rkrec-seg-done') {
+    // 🎙 1026recsplit: 区切りの保存の結果(録音は続いている・待機中)。一言だけ出す
+    if (d.ok) { showIdleNote('前の分を保存しました ✅'); }
+    else { showWarn('前の分の保存に失敗しました: ' + (d.error || '') + ' / カルテ画面で「もう一度」を押してください。'); }
   } else if (d.type === 'rkrec-done') {
     if (d.ok) {
+      if (d.keepOpen && idle) { showIdleNote('保存しました ✅'); return; }
       setState('保存しました ✅', false);
       $('subText').textContent = 'このウィンドウは自動で閉じます。';
+      releaseStream();
       setTimeout(function() { window.close(); }, 1500);
     } else {
       setState('保存エラー', false);
       showErr('カルテ側の保存に失敗しました: ' + (d.error || '') + ' / 録音は残っています。カルテ画面を確認してください。');
     }
+  } else if (d.type === 'rkrec-close') {
+    releaseStream();
+    setTimeout(function() { window.close(); }, 300);
   }
 });
 
@@ -266,9 +336,9 @@ function post(msg) {
 
 // 未送信(pending)を全部もう一度送る
 function resendPending() {
-  var keys = Object.keys(pending);
-  keys.forEach(function(k) {
-    post({ type: 'rkrec-chunk', index: Number(k), base64: pending[k], mime: recMime });
+  Object.keys(pending).forEach(function(k) {
+    var p = pending[k];
+    post({ type: 'rkrec-chunk', index: p.index, key: Number(k), sid: p.sid || '', base64: p.base64, mime: p.mime || recMime });
   });
 }
 
@@ -292,7 +362,7 @@ function downloadLocal() {
   dbGetAll().then(function(rows) {
     if (!rows || !rows.length) {
       rows = Object.keys(pending).map(function(k) {
-        return { index: Number(k), base64: pending[k], mime: recMime };
+        return { index: Number(k), base64: pending[k].base64, mime: pending[k].mime };
       });
     }
     if (!rows.length) { showWarn('保存できる未送信の音声はありません。'); return; }
@@ -339,19 +409,20 @@ setInterval(function() {
     }
     return;
   }
-  keys.forEach(function(k) {
-    post({ type: 'rkrec-chunk', index: Number(k), base64: pending[k], mime: recMime });
-  });
+  resendPending();
 }, 5000);
 
 // ============================================================
 // 🔴 0906m: 音量メーター / マイク名 / 無音警告
 //   ⚠ すべて best-effort。AudioContext が使えない・失敗しても録音は絶対に止めない。
+// 🎙 1026recsplit: 静けさの判定は ScriptProcessor(音声スレッド駆動)で行う。
+//   rAF はウィンドウが隠れると止まるが、こちらは止まらない。失敗したら1秒タイマーで代用する
 // ============================================================
 var audioCtx = null, analyser = null, meterRAF = null, meterData = null;
 var lastSoundAt = 0, silenceShown = false;
 var SILENCE_MS = 10000;   // 10秒 連続で無音なら警告
 var SILENCE_PEAK = 3;     // 128中心の振れ幅がこの値未満＝ほぼ無音
+var procOk = false;
 
 function showMicName(stream) {
   var label = '';
@@ -366,14 +437,28 @@ function attachMeter(stream) {
     if (!AC) { $('meterLabel').textContent = '音量メーター（この端末では表示できません）'; return; }
     audioCtx = new AC();
     if (audioCtx.state === 'suspended') { try { audioCtx.resume(); } catch (e) {} }
-    var src = audioCtx.createMediaStreamSource(stream);
+    meterSrc = audioCtx.createMediaStreamSource(stream);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 512;
-    src.connect(analyser);
+    meterSrc.connect(analyser);
     meterData = new Uint8Array(analyser.fftSize);
     lastSoundAt = Date.now(); silenceShown = false;
     $('silenceBox').style.display = 'none';
     loopMeter();
+    // 🎙 1026recsplit: 静けさの判定(約85msごと。隠れていても動く)
+    try {
+      procNode = audioCtx.createScriptProcessor(4096, 1, 1);
+      procNode.onaudioprocess = function(ev) {
+        try {
+          var ch = ev.inputBuffer.getChannelData(0), pk = 0;
+          for (var i = 0; i < ch.length; i += 2) { var v = Math.abs(ch[i]); if (v > pk) pk = v; }
+          onQuietSample(pk * 128);
+        } catch (e2) {}
+      };
+      meterSrc.connect(procNode);
+      procNode.connect(audioCtx.destination);   // 出力につながないと動かないブラウザがある(無音の経路)
+      procOk = true;
+    } catch (eP) { procOk = false; }
   } catch (e) {
     $('meterLabel').textContent = '音量メーター（表示できませんでした）';
   }
@@ -392,7 +477,7 @@ function loopMeter() {
       fill.style.background = pct > 75 ? '#e5484d' : (pct > 40 ? '#f5a623' : '#2f9e44');
     }
     // 無音判定（録音中のみ）
-    var recording = mediaRecorder && mediaRecorder.state === 'recording';
+    var recording = isRecording();
     if (peak >= SILENCE_PEAK) {
       lastSoundAt = Date.now();
       if (silenceShown) { silenceShown = false; $('silenceBox').style.display = 'none'; }
@@ -401,16 +486,119 @@ function loopMeter() {
       $('silenceBox').textContent = '🔇 音がほとんど入っていません。マイクの位置・ミュート・入力デバイスをご確認ください（録音は続いています）。';
       $('silenceBox').style.display = 'block';
     }
+    if (!procOk) onQuietSample(peak);   // ScriptProcessor が使えないときの代用(表示中だけ)
   } catch (e) {}
   meterRAF = requestAnimationFrame(loopMeter);
 }
 
 function stopMeter() {
   if (meterRAF) { cancelAnimationFrame(meterRAF); meterRAF = null; }
+  try { if (procNode) { procNode.disconnect(); procNode.onaudioprocess = null; } } catch (e0) {}
+  try { if (meterSrc) meterSrc.disconnect(); } catch (e1) {}
   try { if (audioCtx) audioCtx.close(); } catch (e) {}
-  audioCtx = null; analyser = null;
+  audioCtx = null; analyser = null; procNode = null; meterSrc = null; procOk = false;
   var fill = $('meterFill'); if (fill) fill.style.width = '0%';
   var sb = $('silenceBox'); if (sb) sb.style.display = 'none';
+}
+
+// ============================================================
+// 🎙 1026recsplit: 静けさの追跡(media ms 基準)・無音で自動停止・待機中の声の検知
+// ============================================================
+function onQuietSample(peak) {
+  var now = mediaMs();
+  if (peak >= QUIET_PEAK) {
+    if (quietSinceMs !== null) {
+      if (now - quietSinceMs >= SPLIT_SILENCE_SEC * 1000) {
+        quietSpans.push({ s: quietSinceMs, e: now });
+        var keepFrom = now - 15 * 60 * 1000;
+        while (quietSpans.length && quietSpans[0].e < keepFrom) quietSpans.shift();
+      }
+      quietSinceMs = null;
+    }
+    lastSoundMs = now;
+    if (idle) {
+      voiceWin++;
+      if (voiceWin >= 8 && Date.now() - lastVoicePostAt > 10000) {   // 約0.7秒以上「音あり」が続いた
+        lastVoicePostAt = Date.now();
+        post({ type: 'rkrec-voice', reason: idleReason, idleSec: Math.round((Date.now() - idleSince) / 1000) });
+      }
+    }
+  } else {
+    if (quietSinceMs === null) quietSinceMs = now;
+    if (idle) voiceWin = 0;
+    // 無音で自動停止(録音中だけ)
+    if (isRecording() && !intentionalStop && SILENCE_STOP_SEC > 0 && now - quietSinceMs >= SILENCE_STOP_SEC * 1000) {
+      stopInfo = { silenceStartMs: quietSinceMs, quietSec: Math.round((now - quietSinceMs) / 1000) };
+      showWarn('🔇 音のない状態が ' + Math.round(SILENCE_STOP_SEC / 60) + ' 分続いたため、録音を止めて保存します（話し始めると再開します）');
+      keepOpenAfterStop = true;
+      requestStop('無音の自動停止', 'silence');
+    }
+  }
+  var ql = $('quietLine');
+  if (ql && isRecording()) {
+    var q = (quietSinceMs !== null) ? (now - quietSinceMs) : 0;
+    ql.textContent = q >= 3000 ? ('静か: ' + Math.round(q / 1000) + '秒（' + Math.round(SILENCE_STOP_SEC / 60) + '分続くと自動で止めます）') : '';
+  }
+}
+
+// ---- 区切り(止めずに) ----
+//   区切りの時刻 = 切り替えの前 SPLIT_LOOKBACK_SEC 以内で一番近い「静けさ」(SPLIT_SILENCE_SEC 以上)。
+//     ・いま静けさの最中なら、その静けさの始まり(+0.5秒)
+//     ・10秒以上の静けさ(患者さんの入れ替わりらしい)があればその最新を優先、無ければ最新の静けさ
+//     ・無ければ SPLIT_FALLBACK_SEC 前
+//   区切りは今の区切りの始まりより前には戻らない。区切ったら小分けを flush(requestData)して、
+//   その小分けの番号と一緒にカルテ画面へ返す(音声を分けるのはカルテ画面側)
+function doSplit(d) {
+  var now = mediaMs();
+  if (!isRecording() || !sessionStartPerf) {
+    post({ type: 'rkrec-split-at', reqId: d.reqId, ok: false, error: '録音していません' });
+    return;
+  }
+  if (pendingSplit) { post({ type: 'rkrec-split-at', reqId: d.reqId, ok: false, error: '前の区切りを処理中です' }); return; }
+  var lookback = now - SPLIT_LOOKBACK_SEC * 1000;
+  var minMs = segStartMs + 1000;
+  var pick = null, reason = '', sil = null;
+  if (quietSinceMs !== null && now - quietSinceMs >= SPLIT_SILENCE_SEC * 1000 && quietSinceMs >= Math.max(lookback, minMs)) {
+    pick = quietSinceMs + 500;
+    sil = { s: quietSinceMs, e: now };
+    reason = 'いま静か（' + ((now - quietSinceMs) / 1000).toFixed(1) + '秒）';
+  } else {
+    var cands = quietSpans.filter(function(sp) { return sp.e >= lookback && sp.s >= minMs; });
+    var longs = cands.filter(function(sp) { return sp.e - sp.s >= 10000; });
+    var sp = (longs.length ? longs : cands).slice(-1)[0];
+    if (sp) {
+      pick = sp.s + Math.min(1000, Math.round((sp.e - sp.s) / 2));
+      sil = sp;
+      reason = '話が途切れた所（' + ((sp.e - sp.s) / 1000).toFixed(1) + '秒の静けさ・切り替えの' + fmtMs(now - sp.s) + '前）';
+    }
+  }
+  if (pick === null) {
+    pick = Math.max(minMs, now - SPLIT_FALLBACK_SEC * 1000);
+    reason = '途切れが見つからず、切り替えの' + fmtMs(now - pick) + '前';
+  }
+  if (pick > now) pick = now;
+  pendingSplit = { reqId: d.reqId, splitMs: pick, prevStartMs: segStartMs, nowMs: now, reason: reason,
+                   silenceSec: sil ? Math.round((sil.e - sil.s) / 100) / 10 : 0, flushIndex: -1 };
+  segStartMs = pick;
+  try { mediaRecorder.requestData(); } catch (e) { sendSplitReply(chunkIndex - 1); }
+}
+
+function sendSplitReply(flushIdx) {
+  var ps = pendingSplit; if (!ps) return;
+  pendingSplit = null;
+  // 区切りの時刻を含む小分けの番号(その小分けの終わりが区切りの時刻以上の最初のもの)
+  var splitIndex = flushIdx;
+  for (var i = 0; i < chunkEndMs.length; i++) { if (chunkEndMs[i] !== undefined && chunkEndMs[i] >= ps.splitMs) { splitIndex = i; break; } }
+  post({ type: 'rkrec-split-at', reqId: ps.reqId, ok: true, splitMs: ps.splitMs, prevStartMs: ps.prevStartMs, nowMs: ps.nowMs,
+         flushIndex: flushIdx, splitIndex: splitIndex, reason: ps.reason, silenceSec: ps.silenceSec, chunkCount: chunkIndex });
+  showIdleNote('区切りました（' + ps.reason + '）。録音は続いています');
+}
+
+var idleNoteTimer = null;
+function showIdleNote(t) {
+  showIdle(t);
+  clearTimeout(idleNoteTimer);
+  if (!idle) idleNoteTimer = setTimeout(function() { showIdle(''); }, 6000);
 }
 
 // ============================================================
@@ -431,6 +619,7 @@ function startRecording() {
     recMime = (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) ? 'audio/webm;codecs=opus'
             : (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm'))             ? 'audio/webm'
             : 'audio/ogg';
+    beginSession();
     startMediaRecorder(stream);
     startTimer();
     acquireWakeLock();
@@ -438,6 +627,7 @@ function startRecording() {
     attachMeter(stream);     // 🔴 0906m
     setState('録音中', true);
     $('stopBtn').disabled = false;
+    post({ type: 'rkrec-started', serial: sessionSerial });
   }).catch(function(err) {
     setState('録音できません', false);
     var name = (err && err.name) || '';
@@ -453,6 +643,56 @@ function startRecording() {
   });
 }
 
+// 🎙 1026recsplit: 録音1本ぶんの状態を初期化(初回と、待機からの再開の両方)
+function beginSession() {
+  sessionSerial++;
+  sessionStartPerf = performance.now();
+  segStartMs = 0;
+  chunkEndMs = [];
+  chunkIndex = 0;
+  quietSinceMs = null; lastSoundMs = 0; quietSpans = [];
+  pendingSplit = null;
+  recSec = 0;
+  restartCount = 0;
+  intentionalStop = false;
+  stopped = false;
+  stopReason = ''; stopInfo = null;
+  keepOpenAfterStop = false;
+  idle = false; idleReason = ''; voiceWin = 0;
+  clearTimeout(idleTimerId); idleTimerId = null;
+  showIdle('');
+  hideWarn();
+  $('time').textContent = '0:00';
+  $('stopBtn').textContent = '■ 停止して保存';
+  $('subText').innerHTML = 'このウィンドウは録音専用です。閉じずにそのままにしてください。<br>停止するとカルテに自動で保存されます。';
+}
+
+// 🎙 1026recsplit: 待機中にカルテ画面から「新しい録音を始めて」と言われた
+function startSession(d) {
+  if (!idle) { post({ type: 'rkrec-start-result', ok: isRecording(), error: isRecording() ? '' : '待機中ではありません' }); return; }
+  if (unsentCount() > 0) { post({ type: 'rkrec-start-result', ok: false, error: '前の録音の未送信が残っています' }); return; }
+  applyConfig(d || {});
+  var go = function(stream) {
+    recStream = stream;
+    beginSession();
+    startMediaRecorder(stream);
+    startTimer();
+    acquireWakeLock();
+    if (!audioCtx) attachMeter(stream);
+    setState('録音中', true);
+    $('stopBtn').disabled = false;
+    post({ type: 'rkrec-started', serial: sessionSerial });
+  };
+  var alive = false;
+  try { alive = !!(recStream && recStream.getAudioTracks()[0] && recStream.getAudioTracks()[0].readyState === 'live'); } catch (e) {}
+  if (alive) { go(recStream); return; }
+  // マイクが切れていた(待機中にケーブルが抜けた等) → 開き直す
+  setState('マイクを開いています...', false);
+  navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } })
+    .then(function(stream) { stopMeter(); go(stream); showMicName(stream); attachMeter(stream); })
+    .catch(function(err) { post({ type: 'rkrec-start-result', ok: false, error: 'マイクを開けません: ' + ((err && err.name) || '') }); setState('待機中（マイクを開けません）', false, 'idle'); });
+}
+
 function startMediaRecorder(stream) {
   try {
     mediaRecorder = new MediaRecorder(stream, { mimeType: recMime, audioBitsPerSecond: 24000 });
@@ -461,9 +701,11 @@ function startMediaRecorder(stream) {
   }
   mediaRecorder.ondataavailable = function(e) {
     if (e.data && e.data.size > 0) enqueueChunk(e.data);
+    else if (pendingSplit) sendSplitReply(chunkIndex - 1);
   };
   mediaRecorder.onstop = function() {
-    try { if (recStream) recStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+    // 🎙 1026recsplit: 待機するときはマイクを閉じない
+    if (!keepOpenAfterStop) { try { if (recStream) recStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {} }
     if (intentionalStop) finishAndNotify();
     else handleAbnormalStop();
   };
@@ -482,17 +724,20 @@ function startMediaRecorder(stream) {
 
 function enqueueChunk(blob) {
   var idx = chunkIndex++;
+  var key = sessionSerial * 100000 + idx;
+  chunkEndMs[idx] = mediaMs();   // 🎙 1026recsplit: この小分けが終わった時刻
   readerBusy++;
   var reader = new FileReader();
   reader.onload = function(e) {
     readerBusy--;
     var base64 = (String(e.target.result).split(',')[1]) || '';
-    pending[idx] = base64;
-    dbPut({ index: idx, base64: base64, mime: recMime, at: Date.now() });   // ★退避(閉じても残る)
-    post({ type: 'rkrec-chunk', index: idx, base64: base64, mime: recMime });
+    pending[key] = { base64: base64, index: idx, mime: recMime, sid: '' };
+    dbPut({ index: key, base64: base64, mime: recMime, at: Date.now(), sidx: idx, serial: sessionSerial });   // ★退避(閉じても残る)
+    post({ type: 'rkrec-chunk', index: idx, key: key, base64: base64, mime: recMime });
     refreshResendBtn();
+    if (pendingSplit && pendingSplit.flushIndex < 0) { pendingSplit.flushIndex = idx; sendSplitReply(idx); }
   };
-  reader.onerror = function() { readerBusy--; showErr('音声チャンクの読み取りに失敗しました (#' + idx + ')'); };
+  reader.onerror = function() { readerBusy--; showErr('音声チャンクの読み取りに失敗しました (#' + idx + ')'); if (pendingSplit) sendSplitReply(idx); };
   reader.readAsDataURL(blob);
 }
 
@@ -501,6 +746,7 @@ function handleAbnormalStop() {
   if (restartCount >= 3) {
     showErr('録音を再開できませんでした。録れた分を保存します。');
     intentionalStop = true;
+    stopReason = 'abnormal';
     finishAndNotify();
     return;
   }
@@ -529,19 +775,32 @@ function startTimer() {
     var s = String(recSec % 60);
     if (s.length < 2) s = '0' + s;
     $('time').textContent = m + ':' + s;
-    post({ type: 'rkrec-tick', sec: recSec });
-    if (recSec === WARN_SEC) showWarn('⚠️ あと5分で自動停止します(90分の上限)');
+    post({ type: 'rkrec-tick', sec: recSec, ms: mediaMs(), quietSec: quietSinceMs !== null ? Math.round((mediaMs() - quietSinceMs) / 1000) : 0 });
+    if (recSec === WARN_SEC) showWarn('⚠️ あと' + Math.round((MAX_SEC - WARN_SEC) / 60) + '分で自動停止します(' + Math.round(MAX_SEC / 60) + '分の上限)');
     if (recSec >= MAX_SEC && !intentionalStop) {
-      showWarn('⏹ 90分たったため、録音を自動停止して保存します');
-      requestStop('90分の自動停止');
+      // 🎙 1026recsplit: 上限で止めて保存し、待機する(カルテ画面がすぐ新しい録音を始める)
+      showWarn('⏹ ' + Math.round(MAX_SEC / 60) + '分たったため、録音を止めて保存します（続きは新しい録音になります）');
+      keepOpenAfterStop = true;
+      stopInfo = { maxSec: MAX_SEC };
+      requestStop(Math.round(MAX_SEC / 60) + '分の自動停止', 'max');
+    }
+    // ScriptProcessor が止まっている保険: 1秒ごとにメーターの値でも静けさを見る(表示中は rAF が代用済み)
+    if (!procOk && analyser && document.visibilityState !== 'visible') {
+      try { analyser.getByteTimeDomainData(meterData); var pk = 0; for (var i = 0; i < meterData.length; i++) { var dv = Math.abs(meterData[i] - 128); if (dv > pk) pk = dv; } onQuietSample(pk); } catch (e) {}
     }
   }, 1000);
 }
 
 // ---- 停止 → 未送信チャンクを送り切る → カルテ画面へ通知 ----
-function requestStop(reason) {
+function stopBtnClick() {
+  if (idle) { releaseStream(); post({ type: 'rkrec-idle-closed', reason: 'button' }); window.close(); return; }
+  requestStop('手動', 'manual');
+}
+
+function requestStop(reason, kind) {
   if (stopped) return;
   intentionalStop = true;
+  stopReason = kind || 'manual';
   $('stopBtn').disabled = true;
   setState('停止しています... (' + reason + ')', false);
   if (mediaRecorder && mediaRecorder.state === 'recording') {
@@ -556,7 +815,7 @@ function finishAndNotify() {
   stopped = true;
   if (timerId) { clearInterval(timerId); timerId = null; }
   releaseWakeLock();
-  stopMeter();   // 🔴 0906m: メーター停止（AudioContext を閉じる）
+  if (!keepOpenAfterStop) stopMeter();   // 🔴 0906m: メーター停止（AudioContext を閉じる）
   var tries = 0;
   (function waitDrain() {
     var left = unsentCount();
@@ -581,10 +840,50 @@ function finishAndNotify() {
       }
       return;
     }
-    post({ type: 'rkrec-stopped', chunkCount: chunkIndex, mime: (recMime.split(';')[0] || 'audio/webm') });
-    setState('カルテに保存しています...', false);
-    $('subText').textContent = '保存が終わると自動で閉じます。';
+    post({ type: 'rkrec-stopped', chunkCount: chunkIndex, mime: (recMime.split(';')[0] || 'audio/webm'),
+           reason: stopReason, recMs: mediaMs(), segStartMs: segStartMs,
+           silenceStartMs: (stopInfo && stopInfo.silenceStartMs !== undefined) ? stopInfo.silenceStartMs : null,
+           keepOpen: keepOpenAfterStop });
+    if (keepOpenAfterStop) enterIdle(stopReason);
+    else {
+      setState('カルテに保存しています...', false);
+      $('subText').textContent = '保存が終わると自動で閉じます。';
+    }
   })();
+}
+
+// 🎙 1026recsplit: 待機(録音していない・マイクは開いたまま・話し始めたらカルテ画面に知らせる)
+function enterIdle(reason) {
+  idle = true;
+  idleReason = reason || '';
+  idleSince = Date.now();
+  voiceWin = 0;
+  mediaRecorder = null;
+  setState('待機中（録音していません）', false, 'idle');
+  $('time').textContent = '0:00';
+  $('quietLine').textContent = '';
+  $('stopBtn').disabled = false;
+  $('stopBtn').textContent = '✕ 閉じる';
+  var msg = (reason === 'silence') ? '🔇 無音が続いたので録音を止めました（保存しています）。話し始めると自動で再開します。'
+          : (reason === 'max')     ? '⏹ 上限の時間になったので録音を止めました（保存しています）。続きは新しい録音で自動で始まります。'
+          : '保存しています。次の患者さんを開くか、カルテに文字を入れると録音を始めます。';
+  showIdle(msg);
+  $('subText').textContent = 'このウィンドウは待機中です。閉じずにそのままにしておくと、次の録音がすぐ始まります（' + Math.round(IDLE_CLOSE_SEC / 60) + '分たつと自動で閉じます）。';
+  clearTimeout(idleTimerId);
+  idleTimerId = setTimeout(function() {
+    if (!idle) return;
+    post({ type: 'rkrec-idle-closed', reason: 'timeout' });
+    releaseStream();
+    window.close();
+  }, IDLE_CLOSE_SEC * 1000);
+}
+
+function releaseStream() {
+  stopMeter();
+  try { if (recStream) recStream.getTracks().forEach(function(t) { t.stop(); }); } catch (e) {}
+  recStream = null;
+  idle = false;
+  clearTimeout(idleTimerId); idleTimerId = null;
 }
 
 // ---- Wake Lock(画面スリープ抑止) ----
@@ -601,18 +900,18 @@ function releaseWakeLock() {
   try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {}
 }
 document.addEventListener('visibilitychange', function() {
-  if (document.visibilityState === 'visible' && mediaRecorder && mediaRecorder.state === 'recording') acquireWakeLock();
+  if (document.visibilityState === 'visible' && isRecording()) acquireWakeLock();
 });
 
 // ---- 閉じる前の警告(録音中・未送信データがあるとき) ----
 window.addEventListener('beforeunload', function(e) {
-  var recording = mediaRecorder && mediaRecorder.state === 'recording';
-  if (recording || unsentCount() > 0) {
+  if (isRecording() || unsentCount() > 0) {
     e.preventDefault();
     e.returnValue = '録音中または未送信の音声があります。閉じますか？';
     return e.returnValue;
   }
 });
+window.addEventListener('pagehide', function() { try { if (idle) post({ type: 'rkrec-idle-closed', reason: 'unload' }); } catch (e) {} });
 
 // ============================================================
 // 起動: IndexedDB を開く → 前回の未送信チャンクが残っていれば復元して知らせる
@@ -629,9 +928,10 @@ dbOpen().then(function() {
     var maxIdx = -1;
     rows.forEach(function(r) {
       if (typeof r.index === 'number') {
-        pending[r.index] = r.base64;
+        var sidx = (typeof r.sidx === 'number') ? r.sidx : r.index;
+        pending[r.index] = { base64: r.base64, index: sidx, mime: r.mime || '' };
         if (r.mime && !recMime) recMime = r.mime;
-        if (r.index > maxIdx) maxIdx = r.index;
+        if (sidx > maxIdx) maxIdx = sidx;
       }
     });
     chunkIndex = maxIdx + 1;
