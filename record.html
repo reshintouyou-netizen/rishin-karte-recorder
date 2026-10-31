@@ -95,7 +95,7 @@
 'use strict';
 
 // 🔴 0906m: 版番号（先生が「最新か」を判断できるように画面に出す）
-var REC_VERSION = 'v2026-10-26a（切り替えで区切る・無音で自動停止・待機）';
+var REC_VERSION = 'v2026-10-31a（保存で止める・切り替えで前の人を閉じる）';
 
 // ============================================================
 // 設定(カルテ画面からの init で上書きされる)
@@ -148,6 +148,7 @@ var pendingSplit    = null;     // rkrec-split を受けて、小分けの flush
 var stopReason      = '';       // 'manual' | 'parent' | 'silence' | 'max' | 'abnormal'
 var stopInfo        = null;
 var keepOpenAfterStop = false;  // 止めた後も待機する(マイクを開いたまま)
+var dispFromSec     = 0;        // 🎙 1031recsave: 画面の時間をここ(秒)から数える。切り替えで区切ったら「次の患者さんの分」の時間にする(上限・無音の判定は録音全体の recSec のまま)
 var idle            = false;    // 待機中(録音していない・マイクは開いている)
 var idleReason      = '';
 var idleSince       = 0;
@@ -591,7 +592,10 @@ function sendSplitReply(flushIdx) {
   for (var i = 0; i < chunkEndMs.length; i++) { if (chunkEndMs[i] !== undefined && chunkEndMs[i] >= ps.splitMs) { splitIndex = i; break; } }
   post({ type: 'rkrec-split-at', reqId: ps.reqId, ok: true, splitMs: ps.splitMs, prevStartMs: ps.prevStartMs, nowMs: ps.nowMs,
          flushIndex: flushIdx, splitIndex: splitIndex, reason: ps.reason, silenceSec: ps.silenceSec, chunkCount: chunkIndex });
-  showIdleNote('区切りました（' + ps.reason + '）。録音は続いています');
+  // 🎙 1031recsave: 前の患者さんの分はここで閉じてカルテ画面が保存・まとめる。画面の時間は次の患者さんの分(区切りから)にする
+  dispFromSec = Math.max(0, Math.floor(ps.splitMs / 1000));
+  setState('次の患者さんの分を録音中', true);
+  showIdleNote('前の患者さんの分を閉じて、保存・まとめに回しました（' + ps.reason + '）。次の患者さんの分を新しく録音しています');
 }
 
 var idleNoteTimer = null;
@@ -658,6 +662,7 @@ function beginSession() {
   stopped = false;
   stopReason = ''; stopInfo = null;
   keepOpenAfterStop = false;
+  dispFromSec = 0;   // 🎙 1031recsave
   idle = false; idleReason = ''; voiceWin = 0;
   clearTimeout(idleTimerId); idleTimerId = null;
   showIdle('');
@@ -771,8 +776,9 @@ function startTimer() {
   if (timerId) clearInterval(timerId);
   timerId = setInterval(function() {
     recSec++;
-    var m = Math.floor(recSec / 60);
-    var s = String(recSec % 60);
+    var ds = Math.max(0, recSec - dispFromSec);   // 🎙 1031recsave: 切り替えた後は次の患者さんの分の時間
+    var m = Math.floor(ds / 60);
+    var s = String(ds % 60);
     if (s.length < 2) s = '0' + s;
     $('time').textContent = m + ':' + s;
     post({ type: 'rkrec-tick', sec: recSec, ms: mediaMs(), quietSec: quietSinceMs !== null ? Math.round((mediaMs() - quietSinceMs) / 1000) : 0 });
