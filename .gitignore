@@ -1,0 +1,27 @@
+# このリポジトリは公開。置くのは患者さんの画面に要るファイルだけ
+# （設計書・テスト・道具・作業ログ・説明の文書・控え・秘密の値は置かない）
+docs/
+doc/
+tests/
+test/
+tools/
+prompts/
+logs/
+secrets/
+.secrets/
+private/
+node_modules/
+CLAUDE.md
+CLAUDE*.md
+*.md
+!README.md
+*.bak*
+*.log
+*.env
+.env*
+.dev.vars*
+*.json
+*.csv
+*.key
+*.pem
+.claude/
